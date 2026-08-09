@@ -107,6 +107,16 @@ select {
   margin-right: 8px;
 }
 
+.load-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.cancel-button:hover:not(:disabled) {
+  border-color: #dc2626;
+  color: #b91c1c;
+}
+
 .view-buttons button.active {
   border-color: #1d4ed8;
   background: #1d4ed8;

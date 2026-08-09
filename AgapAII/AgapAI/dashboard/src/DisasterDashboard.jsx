@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 const API_ENDPOINT = "http://127.0.0.1:8000/disaster-alerts";
 const ROW_LIMITS = [10, 20, 25, 50, 100];
@@ -65,6 +65,7 @@ export default function DisasterDashboard() {
   const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const abortControllerRef = useRef(null);
 
   const columns = activeCollection === "posts" ? POST_COLUMNS : USER_COLUMNS;
   const rows = activeCollection === "posts" ? posts : users;
@@ -92,6 +93,8 @@ export default function DisasterDashboard() {
 
     setLoading(true);
     setError("");
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     try {
       const params = new URLSearchParams();
@@ -103,23 +106,39 @@ export default function DisasterDashboard() {
       // than silently falling back to whatever is already cached in Mongo.
       params.set("force_refresh", "true");
 
-      const response = await fetch(`${API_ENDPOINT}?${params.toString()}`);
+      const response = await fetch(`${API_ENDPOINT}?${params.toString()}`, {
+        signal: abortController.signal,
+      });
       const data = await response.json();
 
       if (!response.ok) {
         throw new Error(data.detail || `Request failed with status ${response.status}`);
       }
 
+      if (abortController.signal.aborted) {
+        return;
+      }
+
       setPosts(data.posts_collection || []);
       setUsers(data.users_collection || []);
       setCurrentPage(1);
     } catch (fetchError) {
-      setPosts([]);
-      setUsers([]);
+      if (fetchError.name === "AbortError") {
+        setError("");
+        return;
+      }
+
       setError(fetchError.message || "Failed to load data.");
     } finally {
-      setLoading(false);
+      if (abortControllerRef.current === abortController) {
+        abortControllerRef.current = null;
+        setLoading(false);
+      }
     }
+  }
+
+  function cancelLoad() {
+    abortControllerRef.current?.abort();
   }
 
   function selectCollection(collection) {
@@ -175,9 +194,19 @@ export default function DisasterDashboard() {
           />
         </label>
 
-        <button type="button" onClick={() => fetchData()} disabled={!canLoadData}>
-          {loading ? "Loading..." : "Load Data"}
-        </button>
+        <div className="load-controls">
+          <button type="button" onClick={() => fetchData()} disabled={!canLoadData}>
+            {loading ? "Loading..." : "Load Data"}
+          </button>
+          <button
+            type="button"
+            className="cancel-button"
+            onClick={cancelLoad}
+            disabled={!loading}
+          >
+            Cancel
+          </button>
+        </div>
       </section>
 
       {error && <div className="status error">{error}</div>}

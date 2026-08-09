@@ -11,9 +11,24 @@ from agapai_api.bluesky import (
     get_attr,
     search_keyword_posts,
 )
-from agapai_api.clients import client, mongo_connected, posts_col, users_col
+from agapai_api.clients import (
+    authenticate_bluesky,
+    client,
+    get_bluesky_auth_error,
+    is_bluesky_authenticated,
+    mongo_connected,
+    posts_col,
+    users_col,
+)
 from agapai_api.geography import extract_location_name, has_cebu_context
-from agapai_api.keywords import DISASTER_KEYWORDS
+from agapai_api.keywords import (
+    ACTIONABLE_DISASTER_TERMS,
+    BISAYA_EXCLUSION_TERMS,
+    DISASTER_KEYWORDS,
+    ENGLISH_LANGUAGE_MARKERS,
+    NEGATIVE_CONTEXT_TERMS,
+    TAGALOG_LANGUAGE_MARKERS,
+)
 
 router = APIRouter()
 
@@ -93,6 +108,41 @@ def apply_graph_limit(document, graph_limit):
     return document
 
 
+def contains_keyword(text, keyword):
+    return re.search(r"\b" + re.escape(keyword) + r"\b", text.lower()) is not None
+
+
+def find_disaster_keyword(text):
+    for keyword in DISASTER_KEYWORDS:
+        if contains_keyword(text, keyword):
+            return keyword
+    return None
+
+
+def has_any_keyword(text, keywords):
+    return any(contains_keyword(text, term) for term in keywords)
+
+
+def has_supported_language(text):
+    has_tagalog = has_any_keyword(text, TAGALOG_LANGUAGE_MARKERS)
+    has_english = has_any_keyword(text, ENGLISH_LANGUAGE_MARKERS)
+    return has_tagalog or has_english
+
+
+def should_include_disaster_post(text):
+    if not has_supported_language(text):
+        return False
+    if has_any_keyword(text, BISAYA_EXCLUSION_TERMS):
+        return False
+    if has_any_keyword(text, NEGATIVE_CONTEXT_TERMS):
+        return False
+    return (
+        has_any_keyword(text, DISASTER_KEYWORDS)
+        and has_any_keyword(text, ACTIONABLE_DISASTER_TERMS)
+        and has_cebu_context(text)[0]
+    )
+
+
 def get_saved_disaster_data(
     posts_query=None,
     users_query=None,
@@ -112,6 +162,9 @@ def get_saved_disaster_data(
 
     posts = []
     for document in post_cursor:
+        post_text = document.get("text") or document.get("disaster_post_text") or ""
+        if post_text and not should_include_disaster_post(post_text):
+            continue
         document["_id"] = str(document["_id"])
         document = apply_graph_limit(document, graph_limit)
         posts.append(document)
@@ -208,6 +261,18 @@ def get_disaster_posts(
             if saved_result["posts_total"] > 0 or saved_result["users_total"] > 0:
                 return saved_result
 
+        if not is_bluesky_authenticated():
+            authenticate_bluesky()
+
+        if not is_bluesky_authenticated():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Bluesky is not authenticated. Check BLUESKY_HANDLE and "
+                    f"BLUESKY_PASSWORD in api/.env. Error: {get_bluesky_auth_error()}"
+                ),
+            )
+
         posts_collection = []
         users_collection = []
         seen_users = set()
@@ -237,17 +302,15 @@ def get_disaster_posts(
                     if not record or not post_text:
                         continue
 
-                    keyword_found = None
-                    for kw in DISASTER_KEYWORDS:
-                        if re.search(r"\b" + re.escape(kw) + r"\b", post_text.lower()):
-                            keyword_found = kw
-                            break
-
+                    keyword_found = find_disaster_keyword(post_text)
                     if not keyword_found:
                         continue
 
                     is_cebu_post, _cebu_matches = has_cebu_context(post_text)
                     if not is_cebu_post:
+                        continue
+
+                    if not should_include_disaster_post(post_text):
                         continue
 
                     seen_posts.add(post_uri)
