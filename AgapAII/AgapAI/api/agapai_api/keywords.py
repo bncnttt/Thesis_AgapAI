@@ -15,14 +15,17 @@ DISASTER_KEYWORDS = list(ENGLISH_KWS | TAGALOG_KWS)
 HELP_REQUEST_TERMS = {
     "need help", "needs help", "asking help", "asking for help", "send help",
     "please help", "help us", "help me", "help them", "rescue", "need rescue",
-    "needs rescue", "tulong", "kailangan",
+    "needs rescue", "need namin", "need namin ng", "need namin ng damit",
+    "need ko", "need po", "kailangan", "kailangan namin", "kailangan ng damit",
+    "tulong",
 }
 
 VICTIM_IMPACT_TERMS = {
     "victim", "victims", "affected families", "affected residents",
     "evacuee", "evacuees", "evacuated", "stranded", "trapped", "missing",
     "injured", "displaced", "homeless", "nasira ang bahay",
-    "walang kuryente", "brownout",
+    "walang kuryente", "brownout", "mataas ang baha",
+    "wala na kaming natira", "wala nang natira",
 }
 
 VOLUNTEER_DONATION_TERMS = {
@@ -30,6 +33,7 @@ VOLUNTEER_DONATION_TERMS = {
     "relief goods", "libreng relief goods", "donate", "donation", "donations",
     "donasyon", "ayuda", "willing to donate", "may dalang pagkain",
     "mayroon kaming gamot", "naghahanap ng pagkain", "kailangan ng tubig",
+    "damit", "clothes", "used clothes",
 }
 
 ACTIONABLE_DISASTER_TERMS = (

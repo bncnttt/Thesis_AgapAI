@@ -1,8 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from agapai_api.clients import client
-from agapai_api.config import BLUESKY_HANDLE, BLUESKY_PASSWORD
+from agapai_api.clients import authenticate_bluesky
 from agapai_api.routes import router
 
 app = FastAPI(
@@ -26,12 +25,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def authenticate_session():
-    try:
-        print(f"Attempting API login for {BLUESKY_HANDLE}...")
-        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
-        print("Login successful! Network connectivity verified.")
-    except Exception as e:
-        print(f"Startup Login Bypass Warning: Could not authenticate with Bluesky: {repr(e)}")
+    authenticate_bluesky()
 
 
 app.include_router(router)

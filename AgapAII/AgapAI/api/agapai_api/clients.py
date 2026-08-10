@@ -3,12 +3,44 @@ import os
 import pymongo
 from atproto import Client
 
+from agapai_api.config import BLUESKY_HANDLE, BLUESKY_PASSWORD
+
 client = Client()
 mongo_client = None
 db = None
 posts_col = None
 users_col = None
 mongo_connected = False
+bluesky_authenticated = False
+bluesky_auth_error = None
+
+
+def authenticate_bluesky():
+    global bluesky_authenticated, bluesky_auth_error
+
+    try:
+        if not BLUESKY_HANDLE or not BLUESKY_PASSWORD:
+            raise RuntimeError("BLUESKY_HANDLE and BLUESKY_PASSWORD must be set.")
+
+        print(f"Attempting API login for {BLUESKY_HANDLE}...")
+        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
+        bluesky_authenticated = True
+        bluesky_auth_error = None
+        print("Login successful! Network connectivity verified.")
+        return True
+    except Exception as e:
+        bluesky_authenticated = False
+        bluesky_auth_error = repr(e)
+        print(f"CRITICAL WARNING: Could not authenticate with Bluesky: {bluesky_auth_error}")
+        return False
+
+
+def is_bluesky_authenticated():
+    return bluesky_authenticated
+
+
+def get_bluesky_auth_error():
+    return bluesky_auth_error
 
 try:
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")

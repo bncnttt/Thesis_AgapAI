@@ -30,8 +30,11 @@ def search_keyword_posts(keyword, max_posts, since=None, until=None):
 
             response = client.app.bsky.feed.search_posts(params=params)
         except Exception as search_err:
-            print(f"Search API Call failure for '{keyword}': {search_err}")
-            break
+            error_message = repr(search_err)
+            print(f"Search API Call failure for '{keyword}': {error_message}")
+            raise RuntimeError(
+                f"Bluesky search failed for keyword '{keyword}': {error_message}"
+            ) from search_err
 
         page_posts = get_attr(response, 'posts', []) or []
         if not page_posts:
