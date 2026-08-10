@@ -200,6 +200,7 @@ def get_disaster_posts(
     search_limit: int = -1,
     graph_limit: int = 10,
     force_refresh: bool = False,
+    include_graph: bool = False,
 ):
     try:
         if not mongo_connected or posts_col is None or users_col is None:
@@ -283,15 +284,28 @@ def get_disaster_posts(
         inserted_posts_count = 0
         inserted_users_count = 0
         skipped_outside_date_window = 0
+        skipped_search_queries = []
 
         for keyword in DISASTER_KEYWORDS:
             for search_query in build_disaster_search_queries(keyword):
-                for post_view in search_keyword_posts(
-                    search_query,
-                    search_limit,
-                    since=since_value,
-                    until=until_value,
-                ):
+                try:
+                    search_results = search_keyword_posts(
+                        search_query,
+                        search_limit,
+                        since=since_value,
+                        until=until_value,
+                    )
+                except RuntimeError as search_error:
+                    skipped_search_queries.append(
+                        {
+                            "keyword": keyword,
+                            "search_query": search_query,
+                            "error": str(search_error),
+                        }
+                    )
+                    continue
+
+                for post_view in search_results:
                     post_uri = get_attr(post_view, "uri")
                     if post_uri in seen_posts:
                         continue
@@ -359,7 +373,15 @@ def get_disaster_posts(
                     official_follower_count = 0
                     official_following_count = 0
 
-                    if author_did in graph_cache:
+                    if not include_graph:
+                        graph_data = {
+                            "follower_count": 0,
+                            "following_count": 0,
+                            "followers": [],
+                            "following": [],
+                            "mutual_ties": [],
+                        }
+                    elif author_did in graph_cache:
                         graph_data = graph_cache[author_did]
                     else:
                         followers_list = []
@@ -498,6 +520,7 @@ def get_disaster_posts(
                 "date_filter_end": end,
                 "search_limit": search_limit,
                 "graph_limit": graph_limit,
+                "include_graph": include_graph,
                 "search_queries_per_keyword": 1,
                 "disaster_texts_retrieved": len(disaster_texts),
                 "posts_collected_this_cycle": len(posts_collection),
@@ -505,6 +528,7 @@ def get_disaster_posts(
                 "newly_saved_to_mongodb_posts": inserted_posts_count,
                 "newly_saved_to_mongodb_users": inserted_users_count,
                 "skipped_outside_date_window": skipped_outside_date_window,
+                "skipped_search_queries": skipped_search_queries,
             },
             "disaster_texts": disaster_texts,
             "posts_collection": posts_collection,

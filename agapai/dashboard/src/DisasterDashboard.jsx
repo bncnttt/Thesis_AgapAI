@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 
 const API_ENDPOINT = "http://127.0.0.1:8000/disaster-alerts";
+const LIVE_SEARCH_LIMIT = 50;
 const ROW_LIMITS = [10, 20, 25, 50, 100];
 
 const POST_COLUMNS = [
@@ -55,6 +56,24 @@ function formatValue(value) {
   return String(value);
 }
 
+function sortByNewestDate(rows, dateKey) {
+  return [...rows].sort((firstRow, secondRow) => {
+    const firstTime = Date.parse(firstRow[dateKey] || "");
+    const secondTime = Date.parse(secondRow[dateKey] || "");
+
+    if (Number.isNaN(firstTime) && Number.isNaN(secondTime)) {
+      return 0;
+    }
+    if (Number.isNaN(firstTime)) {
+      return 1;
+    }
+    if (Number.isNaN(secondTime)) {
+      return -1;
+    }
+    return secondTime - firstTime;
+  });
+}
+
 export default function DisasterDashboard() {
   const [activeCollection, setActiveCollection] = useState("posts");
   const [fromDate, setFromDate] = useState("");
@@ -105,6 +124,8 @@ export default function DisasterDashboard() {
       // Always ask the API to pull fresh data straight from Bluesky rather
       // than silently falling back to whatever is already cached in Mongo.
       params.set("force_refresh", "true");
+      params.set("include_graph", "false");
+      params.set("search_limit", String(LIVE_SEARCH_LIMIT));
 
       const response = await fetch(`${API_ENDPOINT}?${params.toString()}`, {
         signal: abortController.signal,
@@ -119,9 +140,14 @@ export default function DisasterDashboard() {
         return;
       }
 
-      setPosts(data.posts_collection || []);
-      setUsers(data.users_collection || []);
+      const nextPosts = sortByNewestDate(data.posts_collection || [], "created_at");
+      const nextUsers = sortByNewestDate(data.users_collection || [], "fetched_at");
+      setPosts(nextPosts);
+      setUsers(nextUsers);
       setCurrentPage(1);
+      if (nextPosts.length === 0 && nextUsers.length === 0) {
+        setError("The API finished loading, but no matching data was found for the selected dates.");
+      }
     } catch (fetchError) {
       if (fetchError.name === "AbortError") {
         setError("");
@@ -210,6 +236,11 @@ export default function DisasterDashboard() {
       </section>
 
       {error && <div className="status error">{error}</div>}
+      {loading && (
+        <div className="status loading">
+          Please wait. Collecting data from bluesky.
+        </div>
+      )}
 
       <section className="table-actions" aria-label="Table controls">
         <div className="row-count">

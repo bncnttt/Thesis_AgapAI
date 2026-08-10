@@ -136,6 +136,12 @@ select {
   color: #991b1b;
 }
 
+.status.loading {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e40af;
+}
+
 .row-count {
   align-self: center;
   color: #334155;
