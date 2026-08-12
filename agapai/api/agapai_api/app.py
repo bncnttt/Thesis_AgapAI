@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from agapai_api.clients import authenticate_bluesky
 from agapai_api.routes import router
+from agapai_api.ner_routes import router as ner_router
 
 app = FastAPI(
     title="AgapAI Data Collection Pipeline",
@@ -22,10 +22,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.on_event("startup")
 def authenticate_session():
     authenticate_bluesky()
 
-
 app.include_router(router)
+app.include_router(ner_router)

@@ -20,8 +20,8 @@ def load_local_env():
 
 load_local_env()
 
-BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE", "centblsky.bsky.social")
-BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD", "")
+BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE", "motherg0thel.bsky.social")
+BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD", "temp_000")
 
 GRAPH_PAGE_LIMIT = 50
 DEFAULT_GRAPH_MEMBER_LIMIT = -1

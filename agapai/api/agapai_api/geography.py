@@ -147,3 +147,17 @@ def extract_location_name(text):
             return word.capitalize()
 
     return None
+
+
+CEBU_MUNICIPALITIES_CITIES = {
+    "alcantara", "alcoy", "alegria", "aloguinsan", "argao", "asturias", "badian",
+    "balamban", "bantayan", "barili", "boljoon", "borbon", "carmen", "catmon",
+    "compostela", "consolacion", "cordova", "daanbantayan", "dalaguete",
+    "dumanjug", "ginatilan", "liloan", "madridejos", "malabuyoc", "medellin",
+    "minglanilla", "moalboal", "oslob", "pilar", "pinamungajan", "poro",
+    "ronda", "samboan", "san fernando", "san francisco", "san remigio",
+    "santa fe", "santander", "sibonga", "sogod", "tabogon", "tabuelan",
+    "tuburan", "tudela",
+    "cebu city", "mandaue", "lapu-lapu", "talisay", "toledo", "carcar",
+    "naga", "danao", "bogo",
+}
