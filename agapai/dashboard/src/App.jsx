@@ -8,14 +8,17 @@ export default function App() {
 
   return (
     <div>
-      <div style={{ padding: 10, display: "flex", gap: 8 }}>
-        <button onClick={() => setView("table")}>Posts Table</button>
-        <button onClick={() => setView("ner")}>NER Info</button>
-        <button onClick={() => setView("map")}>Map View</button>
-      </div>
-      {view === "table" && <DisasterDashboard />}
-      {view === "ner" && <NERTableView />}
-      {view === "map" && <NERMapView />}
+      {view === "table" && (
+        <DisasterDashboard view={view} setView={setView} />
+      )}
+
+      {view === "ner" && (
+        <NERTableView view={view} setView={setView} />
+      )}
+
+      {view === "map" && (
+        <NERMapView view={view} setView={setView} />
+      )}
     </div>
   );
 }

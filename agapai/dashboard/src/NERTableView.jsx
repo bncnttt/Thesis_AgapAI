@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 const API_BASE = "http://127.0.0.1:8000";
 
-export default function NERTableView() {
+export default function NERTableView({ view, setView }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -10,12 +10,17 @@ export default function NERTableView() {
   async function loadData() {
     setLoading(true);
     setError("");
+
     try {
       await fetch(`${API_BASE}/ner/process-all`, { method: "POST" });
 
       const response = await fetch(`${API_BASE}/ner/table-data`);
       const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Failed to load NER data.");
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Failed to load NER data.");
+      }
+
       setRows(data.rows || []);
     } catch (err) {
       setError(err.message);
@@ -36,13 +41,44 @@ export default function NERTableView() {
       </header>
 
       <section className="toolbar">
+        <div className="navigation-buttons">
+          <button
+            type="button"
+            className={view === "table" ? "active" : ""}
+            onClick={() => setView("table")}
+          >
+            Posts Table
+          </button>
+
+          <button
+            type="button"
+            className={view === "ner" ? "active" : ""}
+            onClick={() => setView("ner")}
+          >
+            NER Info
+          </button>
+
+          <button
+            type="button"
+            className={view === "map" ? "active" : ""}
+            onClick={() => setView("map")}
+          >
+            Map View
+          </button>
+        </div>
+
         <button type="button" onClick={loadData} disabled={loading}>
           {loading ? "Processing..." : "Refresh"}
         </button>
       </section>
 
       {error && <div className="status error">{error}</div>}
-      {loading && <div className="status loading">Running NER on posts, please wait.</div>}
+
+      {loading && (
+        <div className="status loading">
+          Running NER on posts, please wait.
+        </div>
+      )}
 
       <section className="table-wrap">
         <table>
@@ -56,10 +92,13 @@ export default function NERTableView() {
               <th>Organizations</th>
             </tr>
           </thead>
+
           <tbody>
             {rows.length === 0 && !loading ? (
               <tr>
-                <td colSpan={6} className="empty">No processed posts yet.</td>
+                <td colSpan={6} className="empty">
+                  No processed posts yet.
+                </td>
               </tr>
             ) : (
               rows.map((row) => (

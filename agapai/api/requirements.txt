@@ -2,3 +2,6 @@ atproto
 fastapi
 pymongo
 uvicorn
+calamancy
+psgc
+dateparser

@@ -41,18 +41,9 @@ const USER_COLUMNS = [
 ];
 
 function formatValue(value) {
-  if (value === null || value === undefined) {
-    return "";
-  }
-
-  if (Array.isArray(value)) {
-    return value.length ? value.join(", ") : "[]";
-  }
-
-  if (typeof value === "object") {
-    return JSON.stringify(value);
-  }
-
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) return value.length ? value.join(", ") : "[]";
+  if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }
 
@@ -61,20 +52,15 @@ function sortByNewestDate(rows, dateKey) {
     const firstTime = Date.parse(firstRow[dateKey] || "");
     const secondTime = Date.parse(secondRow[dateKey] || "");
 
-    if (Number.isNaN(firstTime) && Number.isNaN(secondTime)) {
-      return 0;
-    }
-    if (Number.isNaN(firstTime)) {
-      return 1;
-    }
-    if (Number.isNaN(secondTime)) {
-      return -1;
-    }
+    if (Number.isNaN(firstTime) && Number.isNaN(secondTime)) return 0;
+    if (Number.isNaN(firstTime)) return 1;
+    if (Number.isNaN(secondTime)) return -1;
+
     return secondTime - firstTime;
   });
 }
 
-export default function DisasterDashboard() {
+export default function DisasterDashboard({ view, setView }) {
   const [activeCollection, setActiveCollection] = useState("posts");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
@@ -112,17 +98,18 @@ export default function DisasterDashboard() {
 
     setLoading(true);
     setError("");
+
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
     try {
       const params = new URLSearchParams();
+
       if (fromDate && toDate) {
         params.set("start", fromDate);
         params.set("end", toDate);
       }
-      // Always ask the API to pull fresh data straight from Bluesky rather
-      // than silently falling back to whatever is already cached in Mongo.
+
       params.set("force_refresh", "true");
       params.set("include_graph", "false");
       params.set("search_limit", String(LIVE_SEARCH_LIMIT));
@@ -130,23 +117,26 @@ export default function DisasterDashboard() {
       const response = await fetch(`${API_ENDPOINT}?${params.toString()}`, {
         signal: abortController.signal,
       });
+
       const data = await response.json();
 
       if (!response.ok) {
         throw new Error(data.detail || `Request failed with status ${response.status}`);
       }
 
-      if (abortController.signal.aborted) {
-        return;
-      }
+      if (abortController.signal.aborted) return;
 
       const nextPosts = sortByNewestDate(data.posts_collection || [], "created_at");
       const nextUsers = sortByNewestDate(data.users_collection || [], "fetched_at");
+
       setPosts(nextPosts);
       setUsers(nextUsers);
       setCurrentPage(1);
+
       if (nextPosts.length === 0 && nextUsers.length === 0) {
-        setError("The API finished loading, but no matching data was found for the selected dates.");
+        setError(
+          "The API finished loading, but no matching data was found for the selected dates."
+        );
       }
     } catch (fetchError) {
       if (fetchError.name === "AbortError") {
@@ -193,12 +183,39 @@ export default function DisasterDashboard() {
           >
             Posts
           </button>
+
           <button
             type="button"
             className={activeCollection === "users" ? "active" : ""}
             onClick={() => selectCollection("users")}
           >
             Users
+          </button>
+        </div>
+
+        <div className="navigation-buttons">
+          <button
+            type="button"
+            className={view === "table" ? "active" : ""}
+            onClick={() => setView("table")}
+          >
+            Posts Table
+          </button>
+
+          <button
+            type="button"
+            className={view === "ner" ? "active" : ""}
+            onClick={() => setView("ner")}
+          >
+            NER Info
+          </button>
+
+          <button
+            type="button"
+            className={view === "map" ? "active" : ""}
+            onClick={() => setView("map")}
+          >
+            Map View
           </button>
         </div>
 
@@ -221,9 +238,10 @@ export default function DisasterDashboard() {
         </label>
 
         <div className="load-controls">
-          <button type="button" onClick={() => fetchData()} disabled={!canLoadData}>
+          <button type="button" onClick={fetchData} disabled={!canLoadData}>
             {loading ? "Loading..." : "Load Data"}
           </button>
+
           <button
             type="button"
             className="cancel-button"
@@ -236,6 +254,7 @@ export default function DisasterDashboard() {
       </section>
 
       {error && <div className="status error">{error}</div>}
+
       {loading && (
         <div className="status loading">
           Please wait. Collecting data from bluesky.
@@ -266,9 +285,11 @@ export default function DisasterDashboard() {
           >
             Prev
           </button>
+
           <span>
             Page {currentPage} of {totalPages}
           </span>
+
           <button
             type="button"
             onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
@@ -289,6 +310,7 @@ export default function DisasterDashboard() {
               ))}
             </tr>
           </thead>
+
           <tbody>
             {pageRows.length === 0 && !loading ? (
               <tr>
