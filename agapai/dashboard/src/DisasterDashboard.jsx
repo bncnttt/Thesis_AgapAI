@@ -193,15 +193,7 @@ export default function DisasterDashboard({ view, setView }) {
           </button>
         </div>
 
-        <div className="navigation-buttons">
-          <button
-            type="button"
-            className={view === "table" ? "active" : ""}
-            onClick={() => setView("table")}
-          >
-            Posts Table
-          </button>
-
+        <div className="view-buttons">
           <button
             type="button"
             className={view === "ner" ? "active" : ""}
