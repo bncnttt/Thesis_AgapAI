@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException
 
 from agapai_api.clients import posts_col, mongo_connected
 from agapai_api.ner_extraction import extract_entities, get_location_entities
-from agapai_api.ner_entity_selection import select_best_location_entity
+from agapai_api.ner_entity_selection import rank_location_entity_candidates
 from agapai_api.ner_geocoding import geocode_location
 from agapai_api.ner_temporal import resolve_post_datetime
 from agapai_api.geography import CEBU_LOCALITY_MARKERS
@@ -35,8 +35,16 @@ def process_post_for_ner(post_document):
     organizations = [e["text"] for e in all_entities if e["label"] == "ORG"]
 
     municipality_hint = find_municipality_hint(text)
-    best_location_text = select_best_location_entity(location_texts) if location_texts else None
-    coordinates = geocode_location(best_location_text, municipality_hint) if best_location_text else None
+    candidates = rank_location_entity_candidates(location_texts) if location_texts else []
+
+    best_location_text = None
+    coordinates = None
+    for candidate in candidates:
+        result = geocode_location(candidate, municipality_hint)
+        if result is not None:
+            best_location_text = candidate
+            coordinates = result
+            break  # stop at the first candidate that actually resolves
 
     datetime_result = resolve_post_datetime(
         text,
@@ -88,8 +96,9 @@ def process_all_unprocessed_posts():
 @router.get("/ner/table-data")
 def get_ner_table_data():
     """
-    Powers the 'NER Info' dashboard table: every processed post, with
-    empty entity categories shown as 'None/NA' rather than blank.
+    Powers the 'NER Info' dashboard table. Includes both the resolved
+    values AND the raw library outputs (calamanCy entities, PSGC geocode
+    result) so the dashboard can show each library's contribution separately.
     """
     if not mongo_connected or posts_col is None:
         raise HTTPException(status_code=503, detail="MongoDB is not connected.")
@@ -97,29 +106,19 @@ def get_ner_table_data():
     posts = posts_col.find({"ner_processed": True})
     rows = []
     for post in posts:
-        datetime_info = post.get("ner_datetime") or {}
-        if datetime_info.get("source") == "extracted_from_text":
-            display_datetime = datetime_info["expressions"]
-        else:
-            display_datetime = datetime_info.get("fallback_readable")
-
-        coords = post.get("ner_coordinates")
-        if coords and coords.get("ambiguous"):
-            display_location = f"Ambiguous ({coords['candidate_count']} possible matches)"
-        elif coords:
-            display_location = coords.get("matched_name")
-        else:
-            display_location = None
-
         rows.append({
             "_id": str(post["_id"]),
             "text": post.get("text"),
+            "author_handle": post.get("author_handle"),
             "posted_by": post.get("posted_by"),
-            "location": format_for_display(display_location),
-            "datetime": format_for_display(display_datetime),
-            "persons": format_for_display(post.get("ner_persons")),
-            "organizations": format_for_display(post.get("ner_organizations")),
-            "raw_locations_found": format_for_display(post.get("ner_locations")),
+            "raw_locations_found": post.get("ner_locations"),
+            "ner_all_entities": post.get("ner_all_entities"),
+            "ner_selected_location_text": post.get("ner_selected_location_text"),
+            "ner_municipality_hint": post.get("ner_municipality_hint"),
+            "ner_coordinates": post.get("ner_coordinates"),
+            "ner_datetime": post.get("ner_datetime"),
+            "ner_persons": post.get("ner_persons"),
+            "ner_organizations": post.get("ner_organizations"),
         })
 
     return {"status": "success", "rows": rows}

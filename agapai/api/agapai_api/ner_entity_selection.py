@@ -3,7 +3,7 @@ from agapai_api.geography import CEBU_MUNICIPALITIES_CITIES
 GENERIC_LOCATION_WORDS = {"brgy", "brgy.", "barangay", "sitio", "purok", "cebu", "philippines"}
 
 
-def select_best_location_entity(entity_texts):
+def rank_location_entity_candidates(entity_texts):
     """
     calamanCy sometimes splits 'Brgy. San Roque, Cebu' into 3 separate
     entities instead of one merged span. This picks the most useful one:
@@ -22,4 +22,4 @@ def select_best_location_entity(entity_texts):
     final_candidates = step2 if step2 else step1
 
     final_candidates.sort(key=len, reverse=True)
-    return final_candidates[0]
+    return final_candidates
