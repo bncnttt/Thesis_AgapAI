@@ -17,7 +17,7 @@ function formatDateTime(datetimeInfo) {
     : "None";
 }
 
-export default function NERMapView({ setView }) {
+export default function NERMapContent() {
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -43,20 +43,8 @@ export default function NERMapView({ setView }) {
   }, []);
 
   return (
-    <main className="dashboard">
-      <header className="dashboard-header">
-        <h1>NER</h1>
-        <p>Map View</p>
-      </header>
-
-      <section className="toolbar">
-        <div className="view-buttons">
-          <button type="button" onClick={() => setView("table")}>
-            ← Back
-          </button>
-          <button type="button" onClick={() => setView("ner")}>NER Info</button>
-          <button type="button" className="active">Map View</button>
-        </div>
+    <>
+      <section className="toolbar" style={{ marginTop: -4 }}>
         <button type="button" onClick={loadMapData} disabled={loading}>
           {loading ? "Processing..." : "Refresh Map"}
         </button>
@@ -66,11 +54,9 @@ export default function NERMapView({ setView }) {
 
       <MapContainer center={CEBU_CENTER} zoom={10} style={{ height: "600px", width: "100%" }}>
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-
         {posts.map((post) => {
           const coords = post.ner_coordinates;
           if (!coords || coords.ambiguous) return null;
-
           return (
             <Marker key={post._id} position={[coords.latitude, coords.longitude]}>
               <Popup>
@@ -85,6 +71,6 @@ export default function NERMapView({ setView }) {
           );
         })}
       </MapContainer>
-    </main>
+    </>
   );
 }

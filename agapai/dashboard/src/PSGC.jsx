@@ -10,6 +10,31 @@ function parsePsgcBreadcrumb(breadcrumb) {
   };
 }
 
+// When a location is ambiguous, every candidate still shares the same
+// deepest-level name (e.g. all 4 "San Roque" candidates ARE "San Roque" --
+// they only disagree on which municipality it's in). This pulls out
+// whatever's actually consistent across all candidates instead of
+// blanking the whole row just because the city/municipality is unknown.
+function parseAmbiguousCandidates(candidates) {
+  if (!candidates || candidates.length === 0) {
+    return { region: "None", province: "None", cityOrMunicipality: "Ambiguous", barangay: "None" };
+  }
+
+  const allSame = (index) => {
+    const first = candidates[0][index];
+    return candidates.every((c) => c[index] === first) ? first : null;
+  };
+
+  const deepestLevel = Math.max(...candidates.map((c) => c.length)) - 1;
+
+  return {
+    region: allSame(0) || "None",
+    province: allSame(1) || "None",
+    cityOrMunicipality: "Ambiguous",
+    barangay: deepestLevel >= 3 ? (allSame(deepestLevel) || "None") : "None",
+  };
+}
+
 export default function PSGC({ rows, onClose }) {
   return (
     <div style={{
@@ -27,8 +52,9 @@ export default function PSGC({ rows, onClose }) {
         </div>
         <p style={{ color: "#64748b", fontSize: 14 }}>
           Region, province, city/municipality, barangay, and PSGC code retrieved
-          for each post's resolved location. Posts matched to a landmark
-          (not an official PSGC entry) or left unresolved show None.
+          for each post's resolved location. When a location is ambiguous, only
+          the city/municipality is unresolved -- shared fields (region, province,
+          barangay name) are still shown since every candidate agrees on them.
         </p>
 
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
@@ -46,10 +72,20 @@ export default function PSGC({ rows, onClose }) {
             {rows.map((row) => {
               const coords = row.ner_coordinates;
               const isAmbiguous = coords?.ambiguous;
-              const parsed = coords && !isAmbiguous
-                ? parsePsgcBreadcrumb(coords.breadcrumb)
-                : { region: "None", province: "None", cityOrMunicipality: "None", barangay: "None" };
-              const psgcCode = coords && !isAmbiguous ? (coords.psgc_code || "None") : "None";
+
+              let parsed;
+              let psgcCode;
+
+              if (isAmbiguous) {
+                parsed = parseAmbiguousCandidates(coords.candidates);
+                psgcCode = `Ambiguous (${coords.candidate_count} matches)`;
+              } else if (coords) {
+                parsed = parsePsgcBreadcrumb(coords.breadcrumb);
+                psgcCode = coords.psgc_code || "None";
+              } else {
+                parsed = { region: "None", province: "None", cityOrMunicipality: "None", barangay: "None" };
+                psgcCode = "None";
+              }
 
               return (
                 <tr key={row._id} style={{ borderBottom: "1px solid #e5e7eb" }}>
@@ -58,11 +94,7 @@ export default function PSGC({ rows, onClose }) {
                   <td style={{ padding: 6 }}>{parsed.province}</td>
                   <td style={{ padding: 6 }}>{parsed.cityOrMunicipality}</td>
                   <td style={{ padding: 6 }}>{parsed.barangay}</td>
-                  <td style={{ padding: 6 }}>
-                    {isAmbiguous
-                      ? `Ambiguous (${coords.candidate_count} matches)`
-                      : psgcCode}
-                  </td>
+                  <td style={{ padding: 6 }}>{psgcCode}</td>
                 </tr>
               );
             })}

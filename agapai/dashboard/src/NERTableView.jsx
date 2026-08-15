@@ -22,7 +22,7 @@ function formatLocation(coords) {
   return coords.matched_name || "None";
 }
 
-export default function NERTableView({ setView }) {
+export default function NERTableContent() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -50,35 +50,12 @@ export default function NERTableView({ setView }) {
   }, []);
 
   return (
-    <main className="dashboard">
-      <header className="dashboard-header">
-        <h1>NER</h1>
-        <p>NER Info</p>
-      </header>
-
-      <section className="toolbar">
-        <div className="view-buttons">
-          <button type="button" onClick={() => setView("table")}>
-            ← Back
-          </button>
-          <button type="button" className="active">NER Info</button>
-          <button type="button" onClick={() => setView("map")}>Map View</button>
-        </div>
-      </section>
-
+    <>
       <section className="toolbar" style={{ marginTop: -4 }}>
-        <button
-          type="button"
-          onClick={() => setShowCalamancy(true)}
-          style={{ fontSize: 12, padding: "4px 10px" }}
-        >
+        <button type="button" onClick={() => setShowCalamancy(true)} style={{ fontSize: 12, padding: "4px 10px" }}>
           calamanCy Info
         </button>
-        <button
-          type="button"
-          onClick={() => setShowPsgc(true)}
-          style={{ fontSize: 12, padding: "4px 10px" }}
-        >
+        <button type="button" onClick={() => setShowPsgc(true)} style={{ fontSize: 12, padding: "4px 10px" }}>
           PSGC Info
         </button>
       </section>
@@ -99,9 +76,7 @@ export default function NERTableView({ setView }) {
           </thead>
           <tbody>
             {rows.length === 0 && !loading ? (
-              <tr>
-                <td colSpan={5} className="empty">No processed posts yet.</td>
-              </tr>
+              <tr><td colSpan={5} className="empty">No processed posts yet.</td></tr>
             ) : (
               rows.map((row) => (
                 <tr key={row._id}>
@@ -117,12 +92,8 @@ export default function NERTableView({ setView }) {
         </table>
       </section>
 
-      {showCalamancy && (
-        <Calamancy rows={rows} onClose={() => setShowCalamancy(false)} />
-      )}
-      {showPsgc && (
-        <PSGC rows={rows} onClose={() => setShowPsgc(false)} />
-      )}
-    </main>
+      {showCalamancy && <Calamancy rows={rows} onClose={() => setShowCalamancy(false)} />}
+      {showPsgc && <PSGC rows={rows} onClose={() => setShowPsgc(false)} />}
+    </>
   );
 }
