@@ -1,7 +1,6 @@
 from agapai_api.clients import client
 from agapai_api.config import DEFAULT_GRAPH_MEMBER_LIMIT, GRAPH_PAGE_LIMIT, SEARCH_POSTS_PAGE_LIMIT
 
-
 def get_attr(obj, name, default=None):
     if isinstance(obj, dict):
         return obj.get(name, default)
@@ -95,3 +94,4 @@ def collect_graph_members_with_fallback(fetch_method, actor_did, actor_handle, c
             if max_members is not None and max_members > 0 and len(members) >= max_members:
                 return members
     return members
+

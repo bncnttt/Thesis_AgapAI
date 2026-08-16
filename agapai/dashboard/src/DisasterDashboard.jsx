@@ -7,22 +7,42 @@ const LIVE_SEARCH_LIMIT = 50;
 const ROW_LIMITS = [10, 20, 25, 50, 100];
 
 const POST_COLUMNS = [
-  ["_id", "_id"], ["author_did", "author_did"], ["author_handle", "author_handle"],
-  ["posted_by", "posted_by"], ["text", "text"], ["disaster_post_text", "disaster_post_text"],
-  ["retrieval_source", "retrieval_source"], ["search_query", "search_query"],
-  ["created_at", "created_at"], ["time_created_readable", "time_created_readable"],
-  ["collected_at", "collected_at"], ["time_collected_readable", "time_collected_readable"],
-  ["keyword_matched", "keyword_matched"], ["reply_count", "reply_count"],
-  ["repost_count", "repost_count"], ["like_count", "like_count"],
-  ["has_location_clue", "has_location_clue"], ["location_name", "location_name"],
-  ["processed", "processed"], ["social_graph", "social_graph"],
+  ["_id", "_id"],
+  ["author_did", "author_did"],
+  ["author_handle", "author_handle"],
+  ["posted_by", "posted_by"],
+  ["text", "text"],
+  ["disaster_post_text", "disaster_post_text"],
+  ["is_disaster_related", "is_disaster_related"],
+  ["classifier_type", "classifier_type"],
+  ["classifier_score", "classifier_score"],
+  ["retrieval_source", "retrieval_source"],
+  ["search_query", "search_query"],
+  ["created_at", "created_at"],
+  ["time_created_readable", "time_created_readable"],
+  ["collected_at", "collected_at"],
+  ["time_collected_readable", "time_collected_readable"],
+  ["keyword_matched", "keyword_matched"],
+  ["reply_count", "reply_count"],
+  ["repost_count", "repost_count"],
+  ["like_count", "like_count"],
+  ["has_location_clue", "has_location_clue"],
+  ["location_name", "location_name"],
+  ["processed", "processed"],
+  ["social_graph", "social_graph"],
 ];
 
 const USER_COLUMNS = [
-  ["_id", "_id"], ["handle", "handle"], ["display_name", "display_name"],
-  ["follower_count", "follower_count"], ["following_count", "following_count"],
-  ["mutual_tie_count", "mutual_tie_count"], ["followers", "followers"],
-  ["following", "following"], ["mutual_ties", "mutual_ties"], ["fetched_at", "fetched_at"],
+  ["_id", "_id"],
+  ["handle", "handle"],
+  ["display_name", "display_name"],
+  ["follower_count", "follower_count"],
+  ["following_count", "following_count"],
+  ["mutual_tie_count", "mutual_tie_count"],
+  ["followers", "followers"],
+  ["following", "following"],
+  ["mutual_ties", "mutual_ties"],
+  ["fetched_at", "fetched_at"],
 ];
 
 const SUBTITLES = {
@@ -31,8 +51,32 @@ const SUBTITLES = {
   map: "Map View — mapped NER locations from disaster posts",
 };
 
+function getValueWithFallback(row, key) {
+  if (!row) return "";
+
+  if (key === "classifier_type") {
+    return row.classifier_type || row.category || row.classification_label || row.type || "";
+  }
+
+  if (key === "classifier_score") {
+    const score = row.classifier_score ?? row.confidence ?? row.classification_confidence;
+    return score !== undefined && score !== null ? score : "";
+  }
+
+  if (key === "is_disaster_related") {
+    if (typeof row.is_disaster_related === "boolean") {
+      return row.is_disaster_related;
+    }
+    return true;
+  }
+
+  return row[key];
+}
+
 function formatValue(value) {
   if (value === null || value === undefined) return "";
+  if (typeof value === "boolean") return value ? "True" : "False";
+  if (typeof value === "number" && !Number.isInteger(value)) return value.toFixed(2);
   if (Array.isArray(value)) return value.length ? value.join(", ") : "[]";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
@@ -54,6 +98,7 @@ export default function DisasterDashboard() {
   const [activeCollection, setActiveCollection] = useState("posts");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [classifierFilter, setClassifierFilter] = useState("all");
   const [posts, setPosts] = useState([]);
   const [users, setUsers] = useState([]);
   const [rowsPerPage, setRowsPerPage] = useState(20);
@@ -63,7 +108,21 @@ export default function DisasterDashboard() {
   const abortControllerRef = useRef(null);
 
   const columns = activeCollection === "posts" ? POST_COLUMNS : USER_COLUMNS;
-  const rows = activeCollection === "posts" ? posts : users;
+
+  const filteredPosts = useMemo(() => {
+    if (classifierFilter === "all") return posts;
+    return posts.filter((post) => {
+      const postType = (
+        post.classifier_type ||
+        post.category ||
+        post.classification_label ||
+        ""
+      ).toLowerCase();
+      return postType.includes(classifierFilter.toLowerCase());
+    });
+  }, [posts, classifierFilter]);
+
+  const rows = activeCollection === "posts" ? filteredPosts : users;
   const totalRows = rows.length;
   const totalPages = Math.max(1, Math.ceil(totalRows / rowsPerPage));
   const startIndex = totalRows === 0 ? 0 : (currentPage - 1) * rowsPerPage + 1;
@@ -144,6 +203,11 @@ export default function DisasterDashboard() {
     setCurrentPage(1);
   }
 
+  function handleClassifierFilterChange(event) {
+    setClassifierFilter(event.target.value);
+    setCurrentPage(1);
+  }
+
   return (
     <main className="dashboard">
       <header className="dashboard-header">
@@ -151,7 +215,6 @@ export default function DisasterDashboard() {
         <p>{SUBTITLES[view]}</p>
       </header>
 
-      {/* ONE permanent toolbar -- never swapped out, only the content below changes */}
       <section className="toolbar" aria-label="Dashboard controls">
         <div className="view-buttons">
           <button
@@ -186,6 +249,17 @@ export default function DisasterDashboard() {
             Map View
           </button>
         </div>
+
+        {view === "table" && activeCollection === "posts" && (
+          <label>
+            Type
+            <select value={classifierFilter} onChange={handleClassifierFilterChange}>
+              <option value="all">All Posts</option>
+              <option value="victim">Victims Only</option>
+              <option value="volunteer">Volunteers Only</option>
+            </select>
+          </label>
+        )}
 
         <label>
           From
@@ -250,7 +324,9 @@ export default function DisasterDashboard() {
                   pageRows.map((row, index) => (
                     <tr key={row._id || `${activeCollection}-${currentPage}-${index}`}>
                       <td>{(currentPage - 1) * rowsPerPage + index + 1}</td>
-                      {columns.map(([key]) => <td key={key}>{formatValue(row[key])}</td>)}
+                      {columns.map(([key]) => (
+                        <td key={key}>{formatValue(getValueWithFallback(row, key))}</td>
+                      ))}
                     </tr>
                   ))
                 )}

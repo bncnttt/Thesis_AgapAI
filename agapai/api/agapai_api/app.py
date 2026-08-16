@@ -1,8 +1,14 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from agapai_api.clients import authenticate_bluesky
 from agapai_api.routes import router
 from agapai_api.ner_routes import router as ner_router
+from agapai_api.classifier import classify_post
+
+class PostPayload(BaseModel):
+    text: str
+
 
 app = FastAPI(
     title="AgapAI Data Collection Pipeline",
@@ -21,6 +27,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.on_event("startup")
 def authenticate_session():

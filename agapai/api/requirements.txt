@@ -5,3 +5,5 @@ uvicorn
 calamancy
 psgc
 dateparser
+joblib
+scikit-learn==1.8.0

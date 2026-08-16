@@ -11,6 +11,7 @@ from agapai_api.bluesky import (
     get_attr,
     search_keyword_posts,
 )
+from agapai_api.classifier import classify_post
 from agapai_api.clients import (
     authenticate_bluesky,
     client,
@@ -143,6 +144,43 @@ def should_include_disaster_post(text):
     )
 
 
+def enrich_with_classification(document):
+    post_text = document.get("text", "")
+    if "classifier_type" not in document or "classifier_score" not in document:
+        clf = classify_post(post_text)
+        document["classifier_type"] = clf.get(
+            "classifier_type", clf.get("category", "Unclassified")
+        )
+        document["classifier_score"] = clf.get(
+            "classifier_score", clf.get("confidence", 0.0)
+        )
+        document["is_disaster_related"] = clf.get("is_disaster_related", True)
+        document["disaster_post_text"] = clf.get("wsd_augmented_text", post_text)
+
+    return document
+
+def process_and_store_post(raw_post):
+    post_dict = raw_post.dict() if hasattr(raw_post, "dict") else dict(raw_post)
+    text = get_attr(post_dict, "text", "") or get_attr(
+        get_attr(post_dict, "record", {}), "text", ""
+    )
+    clf_result = classify_post(text)
+
+    post_document = {
+        **post_dict,
+        "text": text,
+        "disaster_post_text": clf_result.get("wsd_augmented_text", text),
+        "is_disaster_related": clf_result.get("is_disaster_related", True),
+        "classifier_type": clf_result.get(
+            "classifier_type", clf_result.get("category")
+        ),
+        "classifier_score": clf_result.get(
+            "classifier_score", clf_result.get("confidence")
+        ),
+    }
+
+    return posts_col.insert_one(post_document)
+
 def get_saved_disaster_data(
     posts_query=None,
     users_query=None,
@@ -167,6 +205,7 @@ def get_saved_disaster_data(
             continue
         document["_id"] = str(document["_id"])
         document = apply_graph_limit(document, graph_limit)
+        document = enrich_with_classification(document)
         posts.append(document)
 
     users = []
@@ -225,8 +264,6 @@ def get_disaster_posts(
             since_dt_utc = parse_date_filter(start)
             until_dt_utc = parse_date_filter(end, end_of_day=True)
         else:
-            # No explicit date range but a live refresh was requested (e.g. the
-            # dashboard's "Load Data" button): default to the last 24 hours.
             until_dt_utc = datetime.now(timezone.utc)
             since_dt_utc = until_dt_utc - timedelta(hours=24)
 
@@ -351,19 +388,33 @@ def get_disaster_posts(
                         created_dt_local = created_dt_utc.astimezone(pht_tz)
                         collected_dt_local = collected_dt_utc.astimezone(pht_tz)
 
-                        t_created = created_dt_local.strftime("%A, %B %d, %Y, %I:%M:%S %p PHT")
-                        t_collected = collected_dt_local.strftime("%A, %B %d, %Y, %I:%M:%S %p PHT")
+                        t_created = created_dt_local.strftime(
+                            "%A, %B %d, %Y, %I:%M:%S %p PHT"
+                        )
+                        t_collected = collected_dt_local.strftime(
+                            "%A, %B %d, %Y, %I:%M:%S %p PHT"
+                        )
 
                         time_created_readable_value = t_created.replace(", 0", ", ")
                         time_collected_readable_value = t_collected.replace(", 0", ", ")
 
-                        created_at_value = created_dt_utc.isoformat().replace("+00:00", "Z")
-                        collected_at_value = collected_dt_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                        created_at_value = created_dt_utc.isoformat().replace(
+                            "+00:00", "Z"
+                        )
+                        collected_at_value = (
+                            collected_dt_utc.isoformat(timespec="milliseconds").replace(
+                                "+00:00", "Z"
+                            )
+                        )
                     except Exception:
                         time_created_readable_value = "Unknown Date/Time"
                         time_collected_readable_value = "Unknown Date/Time"
                         created_at_value = created_at_raw
-                        collected_at_value = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                        collected_at_value = (
+                            datetime.now(timezone.utc)
+                            .isoformat(timespec="milliseconds")
+                            .replace("+00:00", "Z")
+                        )
 
                     detected_location = extract_location_name(post_text)
                     reply_count = get_attr(post_view, "reply_count", 0)
@@ -389,13 +440,23 @@ def get_disaster_posts(
                         mutual_ties = []
 
                         try:
-                            actor_profile = client.app.bsky.actor.get_profile(params={"actor": author_did})
-                            official_follower_count = int(get_attr(actor_profile, "followers_count", 0))
-                            official_following_count = int(get_attr(actor_profile, "follows_count", 0))
+                            actor_profile = client.app.bsky.actor.get_profile(
+                                params={"actor": author_did}
+                            )
+                            official_follower_count = int(
+                                get_attr(actor_profile, "followers_count", 0)
+                            )
+                            official_following_count = int(
+                                get_attr(actor_profile, "follows_count", 0)
+                            )
                         except Exception:
                             pass
 
-                        graph_member_limit = None if graph_limit < 0 else max(0, min(graph_limit, 500))
+                        graph_member_limit = (
+                            None
+                            if graph_limit < 0
+                            else max(0, min(graph_limit, 500))
+                        )
 
                         if graph_member_limit is None or graph_member_limit > 0:
                             try:
@@ -423,7 +484,9 @@ def get_disaster_posts(
                         if following_list and followers_list:
                             follower_set = set(followers_list)
                             following_set = set(following_list)
-                            mutual_ties = sorted(follower_set.intersection(following_set))
+                            mutual_ties = sorted(
+                                follower_set.intersection(following_set)
+                            )
 
                         graph_data = {
                             "follower_count": official_follower_count,
@@ -438,13 +501,24 @@ def get_disaster_posts(
                     following_list = graph_data["following"]
                     mutual_ties = graph_data["mutual_ties"]
 
+                    clf_res = classify_post(post_text)
+
                     post_document = {
                         "_id": post_uri,
                         "author_did": author_did,
                         "author_handle": author_handle,
                         "posted_by": display_name,
                         "text": post_text,
-                        "disaster_post_text": post_text,
+                        "disaster_post_text": clf_res.get(
+                            "wsd_augmented_text", post_text
+                        ),
+                        "is_disaster_related": clf_res.get("is_disaster_related", True),
+                        "classifier_type": clf_res.get(
+                            "classifier_type", clf_res.get("category", "Victim")
+                        ),
+                        "classifier_score": clf_res.get(
+                            "classifier_score", clf_res.get("confidence", 0.75)
+                        ),
                         "retrieval_source": "search_posts",
                         "search_query": search_query,
                         "created_at": created_at_value,
@@ -456,11 +530,19 @@ def get_disaster_posts(
                         "repost_count": repost_count,
                         "like_count": like_count,
                         "has_location_clue": True if detected_location else False,
-                        "location_name": detected_location if detected_location else "Unspecified Location",
+                        "location_name": (
+                            detected_location
+                            if detected_location
+                            else "Unspecified Location"
+                        ),
                         "processed": False,
                         "social_graph": {
-                            "follower_count": len(followers_list) if followers_list else 0,
-                            "following_count": len(following_list) if following_list else 0,
+                            "follower_count": (
+                                len(followers_list) if followers_list else 0
+                            ),
+                            "following_count": (
+                                len(following_list) if following_list else 0
+                            ),
                             "followers": followers_list,
                             "following": following_list,
                             "mutual_ties": mutual_ties,
@@ -474,7 +556,11 @@ def get_disaster_posts(
                             "posted_by": display_name,
                             "text": post_text,
                             "keyword_matched": keyword_found,
-                            "location_name": detected_location if detected_location else "Unspecified Location",
+                            "location_name": (
+                                detected_location
+                                if detected_location
+                                else "Unspecified Location"
+                            ),
                             "retrieval_source": "search_posts",
                             "search_query": search_query,
                             "created_at": created_at_value,
@@ -493,9 +579,15 @@ def get_disaster_posts(
                             "_id": author_did,
                             "handle": author_handle,
                             "display_name": display_name,
-                            "follower_count": len(followers_list) if followers_list else 0,
-                            "following_count": len(following_list) if following_list else 0,
-                            "mutual_tie_count": len(mutual_ties) if mutual_ties else 0,
+                            "follower_count": (
+                                len(followers_list) if followers_list else 0
+                            ),
+                            "following_count": (
+                                len(following_list) if following_list else 0
+                            ),
+                            "mutual_tie_count": (
+                                len(mutual_ties) if mutual_ties else 0
+                            ),
                             "followers": followers_list,
                             "following": following_list,
                             "mutual_ties": mutual_ties,
@@ -537,4 +629,6 @@ def get_disaster_posts(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"API Processing Error Trace: {str(e)}")
+        raise HTTPException(
+            status_code=400, detail=f"API Processing Error Trace: {str(e)}"
+        )
