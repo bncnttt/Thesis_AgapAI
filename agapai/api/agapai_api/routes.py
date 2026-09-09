@@ -1,34 +1,35 @@
 from datetime import datetime, timedelta, timezone
-import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 import pymongo
 
 from agapai_api.bluesky import (
-    build_disaster_search_queries,
     collect_graph_members_with_fallback,
     get_attr,
-    search_keyword_posts,
+    resolve_incremental_since,
+    search_bluesky_posts,
 )
-from agapai_api.classifier import classify_post
+from agapai_api.corpus import get_dialect_only_disaster_terms
 from agapai_api.clients import (
     authenticate_bluesky,
     client,
+    db,
     get_bluesky_auth_error,
     is_bluesky_authenticated,
     mongo_connected,
     posts_col,
     users_col,
 )
-from agapai_api.geography import extract_location_name, has_cebu_context
-from agapai_api.keywords import (
-    ACTIONABLE_DISASTER_TERMS,
-    BISAYA_EXCLUSION_TERMS,
-    DISASTER_KEYWORDS,
-    ENGLISH_LANGUAGE_MARKERS,
-    NEGATIVE_CONTEXT_TERMS,
-    TAGALOG_LANGUAGE_MARKERS,
+from agapai_api.geography import (
+    extract_location_name,
+    get_cebu_location_search_terms,
+)
+from agapai_api.pipeline import DISASTER_TYPES, evaluate_post, is_actionable
+from agapai_api.retrieval import (
+    cascade_check_cebu_relevance,
+    retrieve_and_cascade_filter_disaster_posts,
+    retrieve_and_filter_cebu_disaster_posts,
 )
 
 router = APIRouter()
@@ -109,74 +110,29 @@ def apply_graph_limit(document, graph_limit):
     return document
 
 
-def contains_keyword(text, keyword):
-    return re.search(r"\b" + re.escape(keyword) + r"\b", text.lower()) is not None
+def is_saved_disaster_post(document):
+    """
+    Reads the already-computed classification stored on the document at
+    ingestion time -- no re-translation or re-classification on every read.
+    """
+    return document.get("disaster_type") in DISASTER_TYPES
 
-
-def find_disaster_keyword(text):
-    for keyword in DISASTER_KEYWORDS:
-        if contains_keyword(text, keyword):
-            return keyword
-    return None
-
-
-def has_any_keyword(text, keywords):
-    return any(contains_keyword(text, term) for term in keywords)
-
-
-def has_supported_language(text):
-    has_tagalog = has_any_keyword(text, TAGALOG_LANGUAGE_MARKERS)
-    has_english = has_any_keyword(text, ENGLISH_LANGUAGE_MARKERS)
-    return has_tagalog or has_english
-
-
-def should_include_disaster_post(text):
-    if not has_supported_language(text):
-        return False
-    if has_any_keyword(text, BISAYA_EXCLUSION_TERMS):
-        return False
-    if has_any_keyword(text, NEGATIVE_CONTEXT_TERMS):
-        return False
-    return (
-        has_any_keyword(text, DISASTER_KEYWORDS)
-        and has_any_keyword(text, ACTIONABLE_DISASTER_TERMS)
-        and has_cebu_context(text)[0]
-    )
-
-
-def enrich_with_classification(document):
-    post_text = document.get("text", "")
-    if "classifier_type" not in document or "classifier_score" not in document:
-        clf = classify_post(post_text)
-        document["classifier_type"] = clf.get(
-            "classifier_type", clf.get("category", "Unclassified")
-        )
-        document["classifier_score"] = clf.get(
-            "classifier_score", clf.get("confidence", 0.0)
-        )
-        document["is_disaster_related"] = clf.get("is_disaster_related", True)
-        document["disaster_post_text"] = clf.get("wsd_augmented_text", post_text)
-
-    return document
 
 def process_and_store_post(raw_post):
     post_dict = raw_post.dict() if hasattr(raw_post, "dict") else dict(raw_post)
     text = get_attr(post_dict, "text", "") or get_attr(
         get_attr(post_dict, "record", {}), "text", ""
     )
-    clf_result = classify_post(text)
+    evaluation = evaluate_post(text)
 
     post_document = {
         **post_dict,
         "text": text,
-        "disaster_post_text": clf_result.get("wsd_augmented_text", text),
-        "is_disaster_related": clf_result.get("is_disaster_related", True),
-        "classifier_type": clf_result.get(
-            "classifier_type", clf_result.get("category")
-        ),
-        "classifier_score": clf_result.get(
-            "classifier_score", clf_result.get("confidence")
-        ),
+        "translated_text": evaluation["translated_text_en"],
+        "is_disaster_related": evaluation["is_disaster"],
+        "disaster_type": evaluation["disaster_type"],
+        "help_intent": evaluation["intent"],
+        "extracted_locations": evaluation["extracted_locations"],
     }
 
     return posts_col.insert_one(post_document)
@@ -200,12 +156,10 @@ def get_saved_disaster_data(
 
     posts = []
     for document in post_cursor:
-        post_text = document.get("text") or document.get("disaster_post_text") or ""
-        if post_text and not should_include_disaster_post(post_text):
+        if not is_saved_disaster_post(document):
             continue
         document["_id"] = str(document["_id"])
         document = apply_graph_limit(document, graph_limit)
-        document = enrich_with_classification(document)
         posts.append(document)
 
     users = []
@@ -322,285 +276,344 @@ def get_disaster_posts(
         inserted_users_count = 0
         skipped_outside_date_window = 0
         skipped_search_queries = []
+        cebu_candidates_checked = 0
 
-        for keyword in DISASTER_KEYWORDS:
-            for search_query in build_disaster_search_queries(keyword):
-                try:
-                    search_results = search_keyword_posts(
-                        search_query,
-                        search_limit,
-                        since=since_value,
-                        until=until_value,
-                    )
-                except RuntimeError as search_error:
-                    skipped_search_queries.append(
-                        {
-                            "keyword": keyword,
-                            "search_query": search_query,
-                            "error": str(search_error),
-                        }
-                    )
+        # Complements the location-anchored terms below: a genuine post
+        # can name a real Cebu place (e.g. a barangay) without ever saying
+        # the word "Cebu" itself, so the anchored terms alone would never
+        # surface it as a Bluesky search candidate at all. These bare
+        # disaster-term queries widen the candidate pool; the per-post
+        # cascade_check_cebu_relevance() call below (not a literal "Cebu"
+        # match) is what actually confirms Cebu relevance for them.
+        #
+        # Only the Tagalog/Cebuano dialect terms are used here, never the
+        # English WordNet-expanded ones: an English disaster word (e.g.
+        # "blaze", "fire") is also common, unrelated global vocabulary, so
+        # searching it bare with no location anchor pulled in large
+        # volumes of irrelevant global content (verified case: a UK "New
+        # Forest wildfire" post surfaced from a bare "blaze" search).
+        broad_disaster_terms = sorted({
+            term for term in get_dialect_only_disaster_terms() if len(term) >= 4
+        })
+        cebu_location_terms = sorted(set(get_cebu_location_search_terms()) | set(broad_disaster_terms))
+
+        # Dedup against what's already saved: fetched once up front so
+        # each candidate post is a cheap in-memory set lookup, instead of
+        # a per-post DB round trip. Checked BEFORE has_cebu_context/
+        # evaluate_post so re-running "Load Data" doesn't re-run the
+        # expensive translation+classification step on posts we already
+        # have -- that's the actual cost this dedup needs to avoid.
+        existing_post_uris = set(posts_col.distinct("_id"))
+        skipped_already_saved = 0
+
+        # True incremental retrieval: ask Bluesky only for what's newer
+        # than the latest post we've already saved, instead of re-fetching
+        # the full requested range every time. Falls back to the original
+        # requested `since_value` when posts_col is empty (first run).
+        # since_value/until_value themselves stay untouched above, since
+        # they're also used for the saved-data cache-check query, which
+        # must still reflect the user's actually requested range.
+        bluesky_since_value = resolve_incremental_since(posts_col, fallback_since=since_value)
+        used_incremental_fetch = bluesky_since_value != since_value
+        print(
+            f"[AGAPAI LOG] {'Incremental' if used_incremental_fetch else 'Full historical'} "
+            f"fetch: querying Bluesky since {bluesky_since_value}."
+        )
+
+        for search_query in cebu_location_terms:
+            try:
+                search_results = search_bluesky_posts(
+                    search_query,
+                    search_limit,
+                    since=bluesky_since_value,
+                    until=until_value,
+                )
+            except RuntimeError as search_error:
+                skipped_search_queries.append(
+                    {
+                        "search_query": search_query,
+                        "error": str(search_error),
+                    }
+                )
+                continue
+
+            for post_view in search_results:
+                post_uri = get_attr(post_view, "uri")
+                if post_uri in seen_posts:
                     continue
 
-                for post_view in search_results:
-                    post_uri = get_attr(post_view, "uri")
-                    if post_uri in seen_posts:
+                if post_uri in existing_post_uris:
+                    skipped_already_saved += 1
+                    continue
+
+                record = get_attr(post_view, "record")
+                post_text = get_attr(record, "text", "")
+
+                if not record or not post_text:
+                    continue
+
+                author = get_attr(post_view, "author")
+                author_did = get_attr(author, "did")
+                author_handle = get_attr(author, "handle")
+                display_name = get_attr(author, "display_name", author_handle)
+
+                try:
+                    is_cebu_post, _matched_level, cebu_matches = cascade_check_cebu_relevance(
+                        post_text, author_did=author_did, author_handle=author_handle
+                    )
+                except Exception as location_error:
+                    print(f"[AGAPAI LOG] WARNING: Location check failed for {post_uri}: {location_error}")
+                    continue
+                if not is_cebu_post:
+                    continue
+
+                cebu_candidates_checked += 1
+                try:
+                    evaluation = evaluate_post(post_text)
+                except Exception as evaluation_error:
+                    print(f"[AGAPAI LOG] WARNING: Evaluation failed for {post_uri}: {evaluation_error}")
+                    continue
+                if not is_actionable(evaluation):
+                    continue
+
+                seen_posts.add(post_uri)
+
+                created_at_raw = get_attr(record, "created_at")
+
+                try:
+                    created_dt_utc = parse_bluesky_datetime(created_at_raw)
+                    if (
+                        not created_dt_utc
+                        or created_dt_utc < since_dt_utc
+                        or created_dt_utc > until_dt_utc
+                    ):
+                        skipped_outside_date_window += 1
                         continue
 
-                    record = get_attr(post_view, "record")
-                    post_text = get_attr(record, "text", "")
+                    collected_dt_utc = datetime.now(timezone.utc)
 
-                    if not record or not post_text:
-                        continue
+                    pht_tz = timezone(timedelta(hours=8))
+                    created_dt_local = created_dt_utc.astimezone(pht_tz)
+                    collected_dt_local = collected_dt_utc.astimezone(pht_tz)
 
-                    keyword_found = find_disaster_keyword(post_text)
-                    if not keyword_found:
-                        continue
+                    t_created = created_dt_local.strftime(
+                        "%A, %B %d, %Y, %I:%M:%S %p PHT"
+                    )
+                    t_collected = collected_dt_local.strftime(
+                        "%A, %B %d, %Y, %I:%M:%S %p PHT"
+                    )
 
-                    is_cebu_post, _cebu_matches = has_cebu_context(post_text)
-                    if not is_cebu_post:
-                        continue
+                    time_created_readable_value = t_created.replace(", 0", ", ")
+                    time_collected_readable_value = t_collected.replace(", 0", ", ")
 
-                    if not should_include_disaster_post(post_text):
-                        continue
-
-                    seen_posts.add(post_uri)
-
-                    author = get_attr(post_view, "author")
-                    author_did = get_attr(author, "did")
-                    author_handle = get_attr(author, "handle")
-                    display_name = get_attr(author, "display_name", author_handle)
-                    created_at_raw = get_attr(record, "created_at")
-
-                    try:
-                        created_dt_utc = parse_bluesky_datetime(created_at_raw)
-                        if (
-                            not created_dt_utc
-                            or created_dt_utc < since_dt_utc
-                            or created_dt_utc > until_dt_utc
-                        ):
-                            skipped_outside_date_window += 1
-                            continue
-
-                        collected_dt_utc = datetime.now(timezone.utc)
-
-                        pht_tz = timezone(timedelta(hours=8))
-                        created_dt_local = created_dt_utc.astimezone(pht_tz)
-                        collected_dt_local = collected_dt_utc.astimezone(pht_tz)
-
-                        t_created = created_dt_local.strftime(
-                            "%A, %B %d, %Y, %I:%M:%S %p PHT"
-                        )
-                        t_collected = collected_dt_local.strftime(
-                            "%A, %B %d, %Y, %I:%M:%S %p PHT"
-                        )
-
-                        time_created_readable_value = t_created.replace(", 0", ", ")
-                        time_collected_readable_value = t_collected.replace(", 0", ", ")
-
-                        created_at_value = created_dt_utc.isoformat().replace(
+                    created_at_value = created_dt_utc.isoformat().replace(
+                        "+00:00", "Z"
+                    )
+                    collected_at_value = (
+                        collected_dt_utc.isoformat(timespec="milliseconds").replace(
                             "+00:00", "Z"
                         )
-                        collected_at_value = (
-                            collected_dt_utc.isoformat(timespec="milliseconds").replace(
-                                "+00:00", "Z"
-                            )
+                    )
+                except Exception:
+                    time_created_readable_value = "Unknown Date/Time"
+                    time_collected_readable_value = "Unknown Date/Time"
+                    created_at_value = created_at_raw
+                    collected_at_value = (
+                        datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds")
+                        .replace("+00:00", "Z")
+                    )
+
+                detected_location = extract_location_name(post_text)
+                reply_count = get_attr(post_view, "reply_count", 0)
+                repost_count = get_attr(post_view, "repost_count", 0)
+                like_count = get_attr(post_view, "like_count", 0)
+
+                official_follower_count = 0
+                official_following_count = 0
+
+                if not include_graph:
+                    graph_data = {
+                        "follower_count": 0,
+                        "following_count": 0,
+                        "followers": [],
+                        "following": [],
+                        "mutual_ties": [],
+                    }
+                elif author_did in graph_cache:
+                    graph_data = graph_cache[author_did]
+                else:
+                    followers_list = []
+                    following_list = []
+                    mutual_ties = []
+
+                    try:
+                        actor_profile = client.app.bsky.actor.get_profile(
+                            params={"actor": author_did}
+                        )
+                        official_follower_count = int(
+                            get_attr(actor_profile, "followers_count", 0)
+                        )
+                        official_following_count = int(
+                            get_attr(actor_profile, "follows_count", 0)
                         )
                     except Exception:
-                        time_created_readable_value = "Unknown Date/Time"
-                        time_collected_readable_value = "Unknown Date/Time"
-                        created_at_value = created_at_raw
-                        collected_at_value = (
-                            datetime.now(timezone.utc)
-                            .isoformat(timespec="milliseconds")
-                            .replace("+00:00", "Z")
-                        )
+                        pass
 
-                    detected_location = extract_location_name(post_text)
-                    reply_count = get_attr(post_view, "reply_count", 0)
-                    repost_count = get_attr(post_view, "repost_count", 0)
-                    like_count = get_attr(post_view, "like_count", 0)
+                    graph_member_limit = (
+                        None
+                        if graph_limit < 0
+                        else max(0, min(graph_limit, 500))
+                    )
 
-                    official_follower_count = 0
-                    official_following_count = 0
-
-                    if not include_graph:
-                        graph_data = {
-                            "follower_count": 0,
-                            "following_count": 0,
-                            "followers": [],
-                            "following": [],
-                            "mutual_ties": [],
-                        }
-                    elif author_did in graph_cache:
-                        graph_data = graph_cache[author_did]
-                    else:
-                        followers_list = []
-                        following_list = []
-                        mutual_ties = []
-
+                    if graph_member_limit is None or graph_member_limit > 0:
                         try:
-                            actor_profile = client.app.bsky.actor.get_profile(
-                                params={"actor": author_did}
-                            )
-                            official_follower_count = int(
-                                get_attr(actor_profile, "followers_count", 0)
-                            )
-                            official_following_count = int(
-                                get_attr(actor_profile, "follows_count", 0)
+                            following_list = collect_graph_members_with_fallback(
+                                client.app.bsky.graph.get_follows,
+                                author_did,
+                                author_handle,
+                                "follows",
+                                graph_member_limit,
                             )
                         except Exception:
                             pass
 
-                        graph_member_limit = (
-                            None
-                            if graph_limit < 0
-                            else max(0, min(graph_limit, 500))
+                        try:
+                            followers_list = collect_graph_members_with_fallback(
+                                client.app.bsky.graph.get_followers,
+                                author_did,
+                                author_handle,
+                                "followers",
+                                graph_member_limit,
+                            )
+                        except Exception:
+                            pass
+
+                    if following_list and followers_list:
+                        follower_set = set(followers_list)
+                        following_set = set(following_list)
+                        mutual_ties = sorted(
+                            follower_set.intersection(following_set)
                         )
 
-                        if graph_member_limit is None or graph_member_limit > 0:
-                            try:
-                                following_list = collect_graph_members_with_fallback(
-                                    client.app.bsky.graph.get_follows,
-                                    author_did,
-                                    author_handle,
-                                    "follows",
-                                    graph_member_limit,
-                                )
-                            except Exception:
-                                pass
+                    graph_data = {
+                        "follower_count": official_follower_count,
+                        "following_count": official_following_count,
+                        "followers": followers_list,
+                        "following": following_list,
+                        "mutual_ties": mutual_ties,
+                    }
+                    graph_cache[author_did] = graph_data
 
-                            try:
-                                followers_list = collect_graph_members_with_fallback(
-                                    client.app.bsky.graph.get_followers,
-                                    author_did,
-                                    author_handle,
-                                    "followers",
-                                    graph_member_limit,
-                                )
-                            except Exception:
-                                pass
+                followers_list = graph_data["followers"]
+                following_list = graph_data["following"]
+                mutual_ties = graph_data["mutual_ties"]
 
-                        if following_list and followers_list:
-                            follower_set = set(followers_list)
-                            following_set = set(following_list)
-                            mutual_ties = sorted(
-                                follower_set.intersection(following_set)
-                            )
-
-                        graph_data = {
-                            "follower_count": official_follower_count,
-                            "following_count": official_following_count,
-                            "followers": followers_list,
-                            "following": following_list,
-                            "mutual_ties": mutual_ties,
-                        }
-                        graph_cache[author_did] = graph_data
-
-                    followers_list = graph_data["followers"]
-                    following_list = graph_data["following"]
-                    mutual_ties = graph_data["mutual_ties"]
-
-                    clf_res = classify_post(post_text)
-
-                    post_document = {
-                        "_id": post_uri,
+                post_document = {
+                    "_id": post_uri,
+                    "author_did": author_did,
+                    "author_handle": author_handle,
+                    "posted_by": display_name,
+                    "text": post_text,
+                    "translated_text": evaluation["translated_text_en"],
+                    "is_disaster_related": evaluation["is_disaster"],
+                    "disaster_type": evaluation["disaster_type"],
+                    "help_intent": evaluation["intent"],
+                    "extracted_locations": evaluation["extracted_locations"],
+                    "retrieval_source": "search_posts",
+                    "search_query": search_query,
+                    "created_at": created_at_value,
+                    "time_created_readable": time_created_readable_value,
+                    "collected_at": collected_at_value,
+                    "time_collected_readable": time_collected_readable_value,
+                    "cebu_location_matches": cebu_matches,
+                    "reply_count": reply_count,
+                    "repost_count": repost_count,
+                    "like_count": like_count,
+                    "has_location_clue": True if detected_location else False,
+                    "location_name": (
+                        detected_location
+                        if detected_location
+                        else "Unspecified Location"
+                    ),
+                    "processed": False,
+                    "social_graph": {
+                        "follower_count": (
+                            len(followers_list) if followers_list else 0
+                        ),
+                        "following_count": (
+                            len(following_list) if following_list else 0
+                        ),
+                        "followers": followers_list,
+                        "following": following_list,
+                        "mutual_ties": mutual_ties,
+                    },
+                }
+                posts_collection.append(post_document)
+                disaster_texts.append(
+                    {
                         "author_did": author_did,
                         "author_handle": author_handle,
                         "posted_by": display_name,
                         "text": post_text,
-                        "disaster_post_text": clf_res.get(
-                            "wsd_augmented_text", post_text
-                        ),
-                        "is_disaster_related": clf_res.get("is_disaster_related", True),
-                        "classifier_type": clf_res.get(
-                            "classifier_type", clf_res.get("category", "Victim")
-                        ),
-                        "classifier_score": clf_res.get(
-                            "classifier_score", clf_res.get("confidence", 0.75)
-                        ),
-                        "retrieval_source": "search_posts",
-                        "search_query": search_query,
-                        "created_at": created_at_value,
-                        "time_created_readable": time_created_readable_value,
-                        "collected_at": collected_at_value,
-                        "time_collected_readable": time_collected_readable_value,
-                        "keyword_matched": [keyword_found],
-                        "reply_count": reply_count,
-                        "repost_count": repost_count,
-                        "like_count": like_count,
-                        "has_location_clue": True if detected_location else False,
+                        "cebu_location_matches": cebu_matches,
+                        "disaster_type": evaluation["disaster_type"],
+                        "help_intent": evaluation["intent"],
                         "location_name": (
                             detected_location
                             if detected_location
                             else "Unspecified Location"
                         ),
-                        "processed": False,
-                        "social_graph": {
-                            "follower_count": (
-                                len(followers_list) if followers_list else 0
-                            ),
-                            "following_count": (
-                                len(following_list) if following_list else 0
-                            ),
-                            "followers": followers_list,
-                            "following": following_list,
-                            "mutual_ties": mutual_ties,
-                        },
+                        "retrieval_source": "search_posts",
+                        "search_query": search_query,
+                        "created_at": created_at_value,
+                        "time_created_readable": time_created_readable_value,
                     }
-                    posts_collection.append(post_document)
-                    disaster_texts.append(
-                        {
-                            "author_did": author_did,
-                            "author_handle": author_handle,
-                            "posted_by": display_name,
-                            "text": post_text,
-                            "keyword_matched": keyword_found,
-                            "location_name": (
-                                detected_location
-                                if detected_location
-                                else "Unspecified Location"
-                            ),
-                            "retrieval_source": "search_posts",
-                            "search_query": search_query,
-                            "created_at": created_at_value,
-                            "time_created_readable": time_created_readable_value,
-                        }
-                    )
+                )
+
+                try:
+                    posts_col.insert_one(post_document)
+                    inserted_posts_count += 1
+                except pymongo.errors.DuplicateKeyError:
+                    pass
+
+                if author_did not in seen_users:
+                    user_document = {
+                        "_id": author_did,
+                        "handle": author_handle,
+                        "display_name": display_name,
+                        "follower_count": (
+                            len(followers_list) if followers_list else 0
+                        ),
+                        "following_count": (
+                            len(following_list) if following_list else 0
+                        ),
+                        "mutual_tie_count": (
+                            len(mutual_ties) if mutual_ties else 0
+                        ),
+                        "followers": followers_list,
+                        "following": following_list,
+                        "mutual_ties": mutual_ties,
+                        "fetched_at": collected_at_value,
+                    }
+                    users_collection.append(user_document)
+                    seen_users.add(author_did)
 
                     try:
-                        posts_col.insert_one(post_document)
-                        inserted_posts_count += 1
+                        users_col.insert_one(user_document)
+                        inserted_users_count += 1
                     except pymongo.errors.DuplicateKeyError:
                         pass
 
-                    if author_did not in seen_users:
-                        user_document = {
-                            "_id": author_did,
-                            "handle": author_handle,
-                            "display_name": display_name,
-                            "follower_count": (
-                                len(followers_list) if followers_list else 0
-                            ),
-                            "following_count": (
-                                len(following_list) if following_list else 0
-                            ),
-                            "mutual_tie_count": (
-                                len(mutual_ties) if mutual_ties else 0
-                            ),
-                            "followers": followers_list,
-                            "following": following_list,
-                            "mutual_ties": mutual_ties,
-                            "fetched_at": collected_at_value,
-                        }
-                        users_collection.append(user_document)
-                        seen_users.add(author_did)
-
-                        try:
-                            users_col.insert_one(user_document)
-                            inserted_users_count += 1
-                        except pymongo.errors.DuplicateKeyError:
-                            pass
+        print(
+            f"[AGAPAI LOG] Classified {len(posts_collection)} posts as valid "
+            f"disaster posts ({', '.join(DISASTER_TYPES)}) out of "
+            f"{cebu_candidates_checked} Cebu-context candidates checked."
+        )
+        print(
+            f"[AGAPAI LOG] Skipped {skipped_already_saved} already-saved posts "
+            "(deduped by URI before classification)."
+        )
 
         return {
             "status": "success",
@@ -610,21 +623,106 @@ def get_disaster_posts(
                 "date_filter_applied_until": until_value,
                 "date_filter_start": start,
                 "date_filter_end": end,
+                "bluesky_since_value": bluesky_since_value,
+                "used_incremental_fetch": used_incremental_fetch,
                 "search_limit": search_limit,
                 "graph_limit": graph_limit,
                 "include_graph": include_graph,
-                "search_queries_per_keyword": 1,
+                "cebu_location_terms_used": len(cebu_location_terms),
                 "disaster_texts_retrieved": len(disaster_texts),
                 "posts_collected_this_cycle": len(posts_collection),
                 "users_collected_this_cycle": len(users_collection),
                 "newly_saved_to_mongodb_posts": inserted_posts_count,
                 "newly_saved_to_mongodb_users": inserted_users_count,
+                "skipped_already_saved": skipped_already_saved,
                 "skipped_outside_date_window": skipped_outside_date_window,
                 "skipped_search_queries": skipped_search_queries,
             },
             "disaster_texts": disaster_texts,
             "posts_collection": posts_collection,
             "users_collection": users_collection,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"API Processing Error Trace: {str(e)}"
+        )
+
+
+@router.get("/ingest/cebu-posts")
+def ingest_cebu_posts(
+    start_date: str,
+    end_date: str,
+    max_posts: int = -1,
+    include_barangays: bool = False,
+):
+    """
+    Retrieval trigger: queries Bluesky for posts using dynamically extracted,
+    Cebu-anchored PSGC location terms within [start_date, end_date], then
+    applies the strict dual-condition filter (Cebu location context AND at
+    least one dynamically generated disaster term) before persisting
+    anything -- see agapai_api/retrieval.py. Posts that fail either
+    condition (e.g. a waterfall photo captioned with just a place name, or
+    unrelated crime news) are discarded and never reach MongoDB.
+    """
+    try:
+        if not mongo_connected or db is None:
+            raise HTTPException(
+                status_code=503,
+                detail="MongoDB is not connected. Start MongoDB on localhost:27017 and restart the API.",
+            )
+
+        since_dt_utc = parse_date_filter(start_date)
+        until_dt_utc = parse_date_filter(end_date, end_of_day=True)
+        if since_dt_utc > until_dt_utc:
+            raise HTTPException(
+                status_code=422,
+                detail="start_date must be earlier than or equal to end_date.",
+            )
+
+        if not is_bluesky_authenticated():
+            authenticate_bluesky()
+
+        if not is_bluesky_authenticated():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Bluesky is not authenticated. Check BLUESKY_HANDLE and "
+                    f"BLUESKY_PASSWORD in api/.env. Error: {get_bluesky_auth_error()}"
+                ),
+            )
+
+        location_terms = get_cebu_location_search_terms(include_barangays=include_barangays)
+
+        anchored_result = retrieve_and_filter_cebu_disaster_posts(
+            start_date, end_date, max_posts=max_posts, location_terms=location_terms
+        )
+
+        # Complements the location-anchored search above: that search
+        # requires the literal word "Cebu" in every query, so it
+        # structurally can't find a genuine post that names a real Cebu
+        # place (e.g. a barangay) but never says "Cebu" itself. This pass
+        # searches disaster terms alone and confirms Cebu relevance via
+        # the 3-level cascade (post text -> author bio -> author's recent
+        # posts) instead.
+        cascade_result = retrieve_and_cascade_filter_disaster_posts(
+            start_date, end_date, max_posts=max_posts, include_barangays=include_barangays
+        )
+
+        return {
+            "status": "success",
+            "source": "bluesky_dual_condition_filter_plus_cascade",
+            "date_range": {"start_date": start_date, "end_date": end_date},
+            "location_terms_used": len(location_terms),
+            "total_fetched": anchored_result["total_fetched"] + cascade_result["total_fetched"],
+            "raw_posts_saved": anchored_result["matched"] + cascade_result["matched"],
+            "discarded": anchored_result["discarded"] + cascade_result["discarded"],
+            "skipped_already_saved": (
+                anchored_result["skipped_already_saved"] + cascade_result["skipped_already_saved"]
+            ),
+            "anchored_search": anchored_result,
+            "cascade_search": cascade_result,
         }
     except HTTPException:
         raise

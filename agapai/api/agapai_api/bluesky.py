@@ -1,5 +1,10 @@
-from agapai_api.clients import client
+import time
+from datetime import datetime, timezone
+
+from agapai_api.clients import client, db, mongo_connected
 from agapai_api.config import DEFAULT_GRAPH_MEMBER_LIMIT, GRAPH_PAGE_LIMIT, SEARCH_POSTS_PAGE_LIMIT
+from agapai_api.corpus import get_multilingual_disaster_terms
+from agapai_api.geography import PSGC_CEBU_CITIES_MUNICIPALITIES, format_location_name, get_cebu_location_search_terms
 
 def get_attr(obj, name, default=None):
     if isinstance(obj, dict):
@@ -7,7 +12,7 @@ def get_attr(obj, name, default=None):
     return getattr(obj, name, default)
 
 
-def search_keyword_posts(keyword, max_posts, since=None, until=None):
+def search_bluesky_posts(search_term, max_posts, since=None, until=None):
     posts = []
     cursor = None
     while True:
@@ -17,7 +22,7 @@ def search_keyword_posts(keyword, max_posts, since=None, until=None):
 
         try:
             params = {
-                "q": keyword,
+                "q": search_term,
                 "limit": SEARCH_POSTS_PAGE_LIMIT if remaining is None else min(SEARCH_POSTS_PAGE_LIMIT, remaining),
             }
             if since:
@@ -30,9 +35,9 @@ def search_keyword_posts(keyword, max_posts, since=None, until=None):
             response = client.app.bsky.feed.search_posts(params=params)
         except Exception as search_err:
             error_message = repr(search_err)
-            print(f"Search API Call failure for '{keyword}': {error_message}")
+            print(f"Search API Call failure for '{search_term}': {error_message}")
             raise RuntimeError(
-                f"Bluesky search failed for keyword '{keyword}': {error_message}"
+                f"Bluesky search failed for term '{search_term}': {error_message}"
             ) from search_err
 
         page_posts = get_attr(response, 'posts', []) or []
@@ -47,8 +52,244 @@ def search_keyword_posts(keyword, max_posts, since=None, until=None):
     return posts
 
 
-def build_disaster_search_queries(keyword):
-    return [keyword]
+def format_bluesky_date_bound(value, end_of_day=False):
+    """Formats a date/datetime value into the ISO 8601 string Bluesky's search API expects for since/until."""
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+
+    if parsed.tzinfo is None:
+        if end_of_day:
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999000)
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def get_latest_saved_post_created_at(collection):
+    """
+    Returns the created_at of the most recently saved post in the given
+    MongoDB collection (sorted descending), or None if the collection has
+    no posts yet. created_at is stored as an ISO 8601 UTC string, so
+    descending string sort matches chronological order.
+    """
+    latest = collection.find_one(sort=[("created_at", -1)])
+    return latest.get("created_at") if latest else None
+
+
+def resolve_incremental_since(collection, fallback_since):
+    """
+    True incremental retrieval: returns the created_at of our most
+    recently saved post so a Bluesky search only asks for what's new,
+    instead of re-fetching full history every run. Falls back to
+    fallback_since (the caller's originally requested/full-range start)
+    when the collection is empty -- e.g. the very first run.
+
+    The returned boundary is inclusive of that latest post, so it will be
+    fetched again; the existing URI-based dedup check is what's expected
+    to silently skip it, rather than this function nudging the boundary
+    forward and risking missing a post with an identical timestamp.
+    """
+    latest_created_at = get_latest_saved_post_created_at(collection)
+    return latest_created_at if latest_created_at else fallback_since
+
+
+def get_reply_parent_uri(post_view):
+    """Extracts reply.parent.uri from a post's record, if this post is a reply."""
+    record = get_attr(post_view, "record")
+    reply_ref = get_attr(record, "reply") if record else None
+    parent_ref = get_attr(reply_ref, "parent") if reply_ref else None
+    return get_attr(parent_ref, "uri") if parent_ref else None
+
+
+def resolve_parent_post_texts(parent_uris):
+    """
+    Batch-resolves Bluesky post URIs to their text content, for thread
+    stitching: a reply like "It's completely underwater!" means nothing
+    without the parent post it's replying to. Uses app.bsky.feed.getPosts,
+    which accepts up to 25 URIs per call.
+    """
+    unique_uris = sorted({uri for uri in parent_uris if uri})
+    if not unique_uris:
+        return {}
+
+    resolved = {}
+    batch_size = 25
+    for batch_start in range(0, len(unique_uris), batch_size):
+        batch = unique_uris[batch_start:batch_start + batch_size]
+        try:
+            response = client.app.bsky.feed.get_posts(params={"uris": batch})
+        except Exception as fetch_error:
+            print(f"[AGAPAI LOG] WARNING: Failed to resolve {len(batch)} parent post(s): {fetch_error}")
+            continue
+
+        for post in get_attr(response, "posts", []) or []:
+            uri = get_attr(post, "uri")
+            record = get_attr(post, "record")
+            text = get_attr(record, "text", "") if record else ""
+            if uri:
+                resolved[uri] = text
+
+    return resolved
+
+
+def search_cebu_location_posts(start_date, end_date, max_posts=-1, location_terms=None):
+    """
+    Retrieves Bluesky posts created strictly within [start_date, end_date]
+    that mention a dynamically extracted, Cebu-anchored PSGC location term
+    (e.g. "Talisay Cebu"), so foreign homonyms of the same place name are
+    not fetched.
+    """
+    since_value = format_bluesky_date_bound(start_date)
+    until_value = format_bluesky_date_bound(end_date, end_of_day=True)
+
+    terms = location_terms if location_terms is not None else get_cebu_location_search_terms()
+
+    print(f"[AGAPAI LOG] Querying Bluesky API for date range: {start_date} to {end_date}...")
+
+    posts_by_uri = {}
+    for term in terms:
+        for post in search_bluesky_posts(term, max_posts, since=since_value, until=until_value):
+            post_uri = get_attr(post, "uri")
+            if post_uri:
+                posts_by_uri[post_uri] = post
+
+    return list(posts_by_uri.values())
+
+
+def build_dialect_aware_cebu_queries(location_names=None, multilingual_terms=None, max_queries=None):
+    """
+    Combines dynamically extracted PSGC Cebu location names with the
+    dynamically generated multilingual disaster-term corpus into targeted
+    search queries of the form "{location} Cebu {multilingual_term}"
+    (e.g. "Mandaue Cebu baha", "Talisay Cebu sunog").
+    """
+    location_names = location_names if location_names is not None else sorted(PSGC_CEBU_CITIES_MUNICIPALITIES)
+    multilingual_terms = multilingual_terms if multilingual_terms is not None else get_multilingual_disaster_terms()
+
+    queries = sorted({
+        f"{format_location_name(location)} Cebu {term}"
+        for location in location_names
+        for term in multilingual_terms
+    })
+
+    if max_queries is not None and max_queries >= 0:
+        queries = queries[:max_queries]
+
+    print(f"[AGAPAI LOG] Created {len(queries)} dialect-aware search queries for Cebu.")
+    return queries
+
+
+def fetch_and_persist_dialect_aware_cebu_posts(start_date, end_date, max_posts=-1, queries=None):
+    """
+    Executes dialect-aware, Cebu-anchored search queries against Bluesky's
+    app.bsky.feed.searchPosts for posts created strictly within
+    [start_date, end_date], then immediately upserts every raw post payload
+    (matched on URI) into both the MongoDB 'raw_posts' and 'posts'
+    collections so nothing fetched is lost or duplicated.
+    """
+    since_value = format_bluesky_date_bound(start_date)
+    until_value = format_bluesky_date_bound(end_date, end_of_day=True)
+
+    search_queries = queries if queries is not None else build_dialect_aware_cebu_queries()
+
+    posts_by_uri = {}
+    for search_query in search_queries:
+        for post in search_bluesky_posts(search_query, max_posts, since=since_value, until=until_value):
+            post_uri = get_attr(post, "uri")
+            if post_uri:
+                posts_by_uri[post_uri] = post
+
+    saved_count = 0
+    if mongo_connected and db is not None:
+        raw_posts_col = db["raw_posts"]
+        posts_col = db["posts"]
+
+        for post_uri, post in posts_by_uri.items():
+            record = get_attr(post, "record")
+            post_text = get_attr(record, "text", "") if record else get_attr(post, "text", "")
+            author = get_attr(post, "author")
+
+            raw_post_document = {
+                "uri": post_uri,
+                "cid": get_attr(post, "cid"),
+                "author_did": get_attr(author, "did"),
+                "author_handle": get_attr(author, "handle"),
+                "text": post_text,
+                "created_at": get_attr(record, "created_at") if record else None,
+                "retrieval_source": "dialect_aware_cebu_search",
+                "date_range_start": start_date,
+                "date_range_end": end_date,
+            }
+
+            raw_posts_col.update_one({"uri": post_uri}, {"$set": raw_post_document}, upsert=True)
+            posts_col.update_one({"_id": post_uri}, {"$set": raw_post_document}, upsert=True)
+            saved_count += 1
+
+    print(f"[AGAPAI LOG] Saved {saved_count} raw posts into MongoDB 'raw_posts'.")
+
+    return list(posts_by_uri.values())
+
+
+def _call_with_rate_limit_retry(fn, *args, max_retries=3, base_delay_seconds=2, **kwargs):
+    """
+    Generic backoff-and-retry wrapper for Bluesky API calls. The cascade
+    relevance check (get_author_bio_text/get_recent_post_texts) can issue
+    one extra profile/timeline call per candidate post whose own text has
+    no Cebu clue, so it's more exposed to rate limiting than a plain
+    search call. Retries only on a rate-limit-shaped failure; any other
+    exception propagates immediately.
+    """
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as call_error:
+            is_rate_limited = "RateLimit" in repr(call_error) or "429" in repr(call_error)
+            if not is_rate_limited or attempt == max_retries - 1:
+                raise
+            time.sleep(base_delay_seconds * (2 ** attempt))
+
+
+def get_author_bio_text(actor):
+    """
+    Fetches an author's profile bio/description text -- cascade Level 2.
+    A post with no location clue in its own text can still be confidently
+    Cebu-relevant if the author's bio names a Cebu place.
+    """
+    if not actor:
+        return ""
+    try:
+        profile = _call_with_rate_limit_retry(
+            client.app.bsky.actor.get_profile, params={"actor": actor}
+        )
+    except Exception as profile_error:
+        print(f"[AGAPAI LOG] WARNING: Failed to fetch bio for '{actor}': {profile_error}")
+        return ""
+    return get_attr(profile, "description", "") or ""
+
+
+def get_recent_post_texts(actor, limit=5):
+    """
+    Fetches an author's most recent post texts -- cascade Level 3, the
+    last and most expensive signal checked only when neither the post
+    itself nor the author's bio names a Cebu place.
+    """
+    if not actor:
+        return []
+    try:
+        feed_response = _call_with_rate_limit_retry(
+            client.app.bsky.feed.get_author_feed, params={"actor": actor, "limit": limit}
+        )
+    except Exception as feed_error:
+        print(f"[AGAPAI LOG] WARNING: Failed to fetch recent posts for '{actor}': {feed_error}")
+        return []
+
+    texts = []
+    for item in get_attr(feed_response, "feed", []) or []:
+        post = get_attr(item, "post")
+        record = get_attr(post, "record") if post else None
+        text = get_attr(record, "text", "") if record else ""
+        if text:
+            texts.append(text)
+    return texts
 
 
 def collect_graph_members(fetch_method, actor, collection_name, max_members=DEFAULT_GRAPH_MEMBER_LIMIT):

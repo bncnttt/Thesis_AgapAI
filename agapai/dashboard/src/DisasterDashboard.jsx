@@ -11,18 +11,20 @@ const POST_COLUMNS = [
   ["author_did", "author_did"],
   ["author_handle", "author_handle"],
   ["posted_by", "posted_by"],
-  ["text", "text"],
-  ["disaster_post_text", "disaster_post_text"],
+  ["text", "Original Post"],
+  ["translated_text", "Translated Text"],
   ["is_disaster_related", "is_disaster_related"],
-  ["classifier_type", "classifier_type"],
-  ["classifier_score", "classifier_score"],
+  ["disaster_type", "Disaster Type"],
+  ["disaster_type_confidence", "Disaster Type Confidence"],
+  ["help_intent", "Help Intent"],
+  ["help_intent_confidence", "Help Intent Confidence"],
   ["retrieval_source", "retrieval_source"],
   ["search_query", "search_query"],
   ["created_at", "created_at"],
   ["time_created_readable", "time_created_readable"],
   ["collected_at", "collected_at"],
   ["time_collected_readable", "time_collected_readable"],
-  ["keyword_matched", "keyword_matched"],
+  ["cebu_location_matches", "cebu_location_matches"],
   ["reply_count", "reply_count"],
   ["repost_count", "repost_count"],
   ["like_count", "like_count"],
@@ -53,15 +55,6 @@ const SUBTITLES = {
 
 function getValueWithFallback(row, key) {
   if (!row) return "";
-
-  if (key === "classifier_type") {
-    return row.classifier_type || row.category || row.classification_label || row.type || "";
-  }
-
-  if (key === "classifier_score") {
-    const score = row.classifier_score ?? row.confidence ?? row.classification_confidence;
-    return score !== undefined && score !== null ? score : "";
-  }
 
   if (key === "is_disaster_related") {
     if (typeof row.is_disaster_related === "boolean") {
@@ -112,13 +105,8 @@ export default function DisasterDashboard() {
   const filteredPosts = useMemo(() => {
     if (classifierFilter === "all") return posts;
     return posts.filter((post) => {
-      const postType = (
-        post.classifier_type ||
-        post.category ||
-        post.classification_label ||
-        ""
-      ).toLowerCase();
-      return postType.includes(classifierFilter.toLowerCase());
+      const disasterType = (post.disaster_type || "").toLowerCase();
+      return disasterType === classifierFilter.toLowerCase();
     });
   }, [posts, classifierFilter]);
 
@@ -166,8 +154,29 @@ export default function DisasterDashboard() {
       if (!response.ok) throw new Error(data.detail || `Request failed with status ${response.status}`);
       if (abortController.signal.aborted) return;
 
-      const nextPosts = sortByNewestDate(data.posts_collection || [], "created_at");
-      const nextUsers = sortByNewestDate(data.users_collection || [], "fetched_at");
+      // The force-refresh call above only surfaces what that one live
+      // Bluesky search cycle found, not everything already saved in
+      // MongoDB. Follow up with a saved-data read (no force_refresh, no
+      // search_limit cap) so the table reflects the full merged dataset.
+      const savedParams = new URLSearchParams();
+      if (fromDate && toDate) {
+        savedParams.set("start", fromDate);
+        savedParams.set("end", toDate);
+      }
+      savedParams.set("include_graph", "false");
+      savedParams.set("search_limit", "-1");
+
+      const savedResponse = await fetch(`${API_ENDPOINT}?${savedParams.toString()}`, {
+        signal: abortController.signal,
+      });
+      const savedData = await savedResponse.json();
+      if (!savedResponse.ok) {
+        throw new Error(savedData.detail || `Request failed with status ${savedResponse.status}`);
+      }
+      if (abortController.signal.aborted) return;
+
+      const nextPosts = sortByNewestDate(savedData.posts_collection || [], "created_at");
+      const nextUsers = sortByNewestDate(savedData.users_collection || [], "fetched_at");
       setPosts(nextPosts);
       setUsers(nextUsers);
       setCurrentPage(1);
@@ -252,11 +261,14 @@ export default function DisasterDashboard() {
 
         {view === "table" && activeCollection === "posts" && (
           <label>
-            Type
+            Disaster Type
             <select value={classifierFilter} onChange={handleClassifierFilterChange}>
               <option value="all">All Posts</option>
-              <option value="victim">Victims Only</option>
-              <option value="volunteer">Volunteers Only</option>
+              <option value="flood">Flood</option>
+              <option value="earthquake">Earthquake</option>
+              <option value="typhoon">Typhoon</option>
+              <option value="fire">Fire</option>
+              <option value="landslide">Landslide</option>
             </select>
           </label>
         )}
