@@ -1,0 +1,15 @@
+atproto
+fastapi
+pymongo
+uvicorn
+calamancy
+psgc
+dateparser
+joblib
+scikit-learn==1.8.0
+nltk
+google-generativeai
+transformers
+torch
+sentencepiece
+langdetect
